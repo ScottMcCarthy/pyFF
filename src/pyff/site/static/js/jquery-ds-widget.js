@@ -34,20 +34,26 @@ jQuery(function ($) {
                     return obj._template.render(item);
                 }
             }
-            if (typeof obj.options['render_search_result'] != 'function') {
+            if (!$.isFunction(obj.options['render_search_result'])) {
                 obj.options['render_search_result'] = obj.options['render'];
             }
-            if (typeof obj.options['render_saved_choice'] != 'function') {
+            if (!$.isFunction(obj.options['render_saved_choice'])) {
                 obj.options['render_saved_choice'] = obj.options['render'];
             }
-            if (typeof obj.options['fallback_icon'] != 'function') {
+            if (!$.isFunction(obj.options['fallback_icon'])) {
                 obj.options['fallback_icon'] = $.noop;
             }
-            if (typeof obj.options['on_show'] != 'function') {
+            if (!$.isFunction(obj.options['on_show'])) {
                 obj.options['on_show'] = $.noop;
             }
-            if (typeof obj.options['on_hide'] != 'function') {
+            if (!$.isFunction(obj.options['on_hide'])) {
                 obj.options['on_hide'] = $.noop;
+            }
+            if (!$.isFunction(obj.options['after'])) {
+                obj.options['after'] = $.noop;
+            }
+            if (!$.isFunction(obj.options['before'])) {
+                obj.options['before'] = function(x) { return x; }
             }
             obj._update();
         },
@@ -59,46 +65,42 @@ jQuery(function ($) {
 
         _after: function (count) {
             var saved_choices_element = $(this.options['saved_choices_selector']);
-            if (typeof this.options['after'] == 'function') {
-                return this.options['after'](count, saved_choices_element);
-            } else {
+            if (this.discovery_service_search_url) {
+                var obj = this;
+                var search_result_element = $(obj.options['search_result_selector']);
+                var search_base, search_related, list_uri;
+                search_base = obj.element.attr('data-search');
+                search_related = obj.element.attr('data-related');
+                $(obj.input_field_selector).focus();
+                search_result_element.btsListFilter(obj.input_field_selector, {
+                    resetOnBlur: false,
+                    casesensitive: false,
+                    itemEl: '.identityprovider',
+                    itemFilter: function (item, val) { return true; },
+                    emptyNode: obj.options['no_results'],
+                    onShow: obj.options['on_show'],
+                    onHide: obj.options['on_hide'],
+                    getValue: function(that) {
+                        var v = that.val();
+                        var i = v.indexOf('@');
+                        return i > -1 ? v.substring(i+1,v.length) : v;
+                    },
+                    sourceData: function (text, callback) {
+                        var remote = search_base + "?query=" + text + "&entity_filter={http://macedir.org/entity-category}http://pyff.io/category/discoverable";
 
-                if (this.discovery_service_search_url) {
-                    var obj = this;
-                    var search_result_element = $(obj.options['search_result_selector']);
-                    var search_base, search_related, list_uri;
-                    search_base = obj.element.attr('data-search');
-                    search_related = obj.element.attr('data-related');
-                    $(obj.input_field_selector).focus();
-                    search_result_element.btsListFilter(obj.input_field_selector, {
-                        resetOnBlur: false,
-                        itemEl: '.identityprovider',
-                        emptyNode: obj.options['no_results'],
-                        onShow: obj.options['on_show'],
-                        onHide: obj.options['on_hide'],
-                        sourceData: function (text, callback) {
-                            var remote = search_base + "?query=" + text + "&entity_filter={http://macedir.org/entity-category}http://pyff.io/category/discoverable";
-
-                            if (search_related) {
-                                remote = remote + "&related=" + search_related;
-                            }
-                            return $.getJSON(remote, callback);
-                        },
-                        sourceNode: function (data) {
-                            data.sticky = true;
-                            return obj.options['render_search_result'](data);
-                        },
-                        cancelNode: null
-                    });
-                }
-                if (count == 0) {
-                    $("#searchwidget").show();
-                    $("#addwidget").hide();
-                } else {
-                    $("#searchwidget").hide();
-                    $("#addwidget").show();
-                }
+                        if (search_related) {
+                            remote = remote + "&related=" + search_related;
+                        }
+                        return $.getJSON(remote, callback);
+                    },
+                    sourceNode: function (data) {
+                        data.sticky = true;
+                        return obj.options['render_search_result'](data);
+                    },
+                    cancelNode: null
+                });
             }
+            this.options['after'](count, saved_choices_element);
         },
 
         _update: function () {
@@ -110,6 +112,7 @@ jQuery(function ($) {
             obj.input_field_selector = obj.options['input_field_selector'] || obj.element.attr('data-inputfieldselector') || 'input';
             obj.selection_selector = obj.options['selection_selector'];
             obj._ds = new DiscoveryService(obj.mdq_url, obj.discovery_service_storage_url, obj.sp_entity_id);
+            obj._count = 0;
             var top_element = obj.element;
 
             $('img.pyff-idp-icon').bind('error', function () {
@@ -134,31 +137,31 @@ jQuery(function ($) {
                 e.preventDefault();
             });
 
-            $('body').on('click', '.close', function (e) {
+            $('body').on('click', '.cancel', function (e) {
                 e.stopPropagation();
                 var entity_element = $(this).closest(obj.selection_selector);
                 var entity_id = entity_element.attr('data-href');
                 if (entity_id) {
                     obj._ds.remove(entity_id).then(function () {
                         entity_element.remove();
+                    }).then(function() {
+                        obj._count -= 1;
+                        obj._after(obj._count)
                     });
                 }
             });
 
             obj._ds.choices().then(function (entities) {
-                if (typeof obj.options['before'] === 'function') {
-                    entities = obj.options['before'](entities);
-                }
-                return entities;
+                return obj.options['before'](entities);
             }).then(function (entities) {
-                var count = 0;
+                obj._count = 0;
                 var saved_choices_element = $(obj.options['saved_choices_selector']);
                 entities.forEach(function (item) {
                     var entity_element = obj.options['render_saved_choice'](item.entity);
                     saved_choices_element.prepend(entity_element);
-                    count++;
+                    obj._count++;
                 });
-                return count;
+                return obj._count;
             }).then(function (count) {
                 obj._after(count);
             })
