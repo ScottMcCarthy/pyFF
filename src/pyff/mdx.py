@@ -249,7 +249,7 @@ listed using the 'role' attribute to the link elements.
 
         _links('/entities/')
         for a in self.server.md.store.collections():
-            if '://' not in a:
+            if a is not None and '://' not in a:
                 _links(a)
 
         for entity_id in self.server.md.store.entity_ids():
@@ -430,14 +430,16 @@ Search the active set for matching entities.
         """
         cherrypy.response.headers['Content-Type'] = 'application/json'
         if paged:
-            res, more, total = self.server.md.search(query,
-                                                     page=int(page),
-                                                     page_limit=int(page_limit),
-                                                     entity_filter=entity_filter,
-                                                     related=related)
+            res, more, total = self.server.md.store.search(query,
+                                                           page=int(page),
+                                                           page_limit=int(page_limit),
+                                                           entity_filter=entity_filter,
+                                                           related=related)
             return dumps({'entities': res, 'more': more, 'total': total})
         else:
-            return dumps(self.server.md.search(query, entity_filter=entity_filter, related=related))
+            return dumps(self.server.md.store.search(query,
+                                                     entity_filter=entity_filter,
+                                                     related=related))
 
     @cherrypy.expose
     def index(self):
@@ -476,7 +478,7 @@ class MDServer(object):
         self._pipes = pipes
         self.lock = ReadWriteLock()
         self.plumbings = [plumbing(v) for v in pipes]
-        self.refresh = MDUpdate(cherrypy.engine, server=self, frequency=config.frequency)
+        self.refresh = MDUpdate(cherrypy.engine, server=self, frequency=config.update_frequency)
         self.refresh.subscribe()
         self.aliases = config.aliases
         self.psl = PublicSuffixList()
@@ -629,19 +631,19 @@ class MDServer(object):
                     log.debug("created query: %s" % ",".join(query))
 
                 if paged:
-                    res, more, total = self.md.search(query,
-                                                      path=q,
-                                                      page=int(page),
-                                                      page_limit=int(page_limit),
-                                                      entity_filter=entity_filter,
-                                                      related=related)
+                    res, more, total = self.md.store.search(query,
+                                                            path=q,
+                                                            page=int(page),
+                                                            page_limit=int(page_limit),
+                                                            entity_filter=entity_filter,
+                                                            related=related)
                     # log.debug(dumps({'entities': res, 'more': more, 'total': total}))
                     return dumps({'entities': res, 'more': more, 'total': total})
                 else:
-                    return dumps(self.md.search(query,
-                                                path=q,
-                                                entity_filter=entity_filter,
-                                                related=related))
+                    return dumps(self.md.store.search(query,
+                                                      path=q,
+                                                      entity_filter=entity_filter,
+                                                      related=related))
             elif accept.get('text/html'):
                 if not q:
                     if pfx:
@@ -747,7 +749,7 @@ def main():
             elif o in ('--autoreload', '-a'):
                 config.autoreload = True
             elif o in '--frequency':
-                config.frequency = int(a)
+                config.update_frequency = int(a)
             elif o in ('-A', '--alias'):
                 (a, colon, uri) = a.partition(':')
                 assert (colon == ':')

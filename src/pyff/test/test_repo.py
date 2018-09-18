@@ -4,16 +4,17 @@ from unittest import TestCase
 import os
 
 from pyff.constants import NS
+from pyff.store import make_store_instance
 from pyff.mdrepo import MDRepository
 from pyff.utils import resource_filename, parse_xml, root, hash_id, MetadataException
-from pyff.samlmd import set_entity_attributes, is_idp, is_sp, entity_icon, \
+from pyff.samlmd import set_entity_attributes, is_idp, is_sp, entity_icon_url, \
     entity_domains, entity_extended_display, entity_display_name, entity_simple_summary, \
     metadata_expiration, annotate_entity, sha1_id
 
 class TestRepo(TestCase):
     def setUp(self):
         self.md = MDRepository()
-        self.md.store = self.md.store_class()
+        self.md.store = make_store_instance()
         self.datadir = resource_filename('metadata', 'test/data')
         self.xml_source = os.path.join(self.datadir, 'test01.xml')
         self.swamid_source = os.path.join(self.datadir, 'swamid-2.0-test.xml')
@@ -52,7 +53,7 @@ class TestRepo(TestCase):
         e = self.md.lookup(entity_id)[0]
         assert (is_idp(e))
         assert (not is_sp(e))
-        icon = entity_icon(e)
+        icon = entity_icon_url(e)
         assert ('url' in icon)
         assert ('https://www.example.com/static/images/umu_logo.jpg' in icon['url'])
         assert ('width' in icon)
@@ -101,8 +102,6 @@ class TestRepo(TestCase):
         assert (summary['title'] == 'Example University')
         assert (summary['descr'] == 'Identity Provider for Example University')
         assert (summary['entityID'] == entity_id)
-        assert ('entity_icon' in summary)
-        assert ('icon_url' in summary and summary['entity_icon'] == summary['icon_url'])
         assert ('domains' in summary)
         assert ('id' in summary)
 
@@ -116,7 +115,6 @@ class TestRepo(TestCase):
         name, desc = entity_extended_display(funet_connect)
         assert(name == 'FUNET E-Meeting Service')
         dn = entity_extended_display(funet_connect)
-
 
     def test_missing(self):
         swamid = root(self.swamid)

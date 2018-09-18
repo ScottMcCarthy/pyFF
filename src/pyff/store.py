@@ -1,24 +1,32 @@
 
 from six import StringIO
-import time
 from copy import deepcopy
 import re
 from redis import Redis
-from .constants import NS, ATTRS
+from .constants import NS, ATTRS, ATTRS_INV
 from .decorators import cached
 from .logs import log
-from .utils import root, dumptree, parse_xml, hex_digest, hash_id, valid_until_ts
-from .samlmd import EntitySet, iter_entities, entity_attribute_dict, is_sp, is_idp
-
-
-def _now():
-    return int(time.time())
-
+from .constants import config
+from .utils import root, dumptree, parse_xml, hex_digest, hash_id, valid_until_ts, \
+    avg_domain_distance, ts_now, load_callable
+from .samlmd import EntitySet, iter_entities, entity_attribute_dict, is_sp, is_idp, entity_info, \
+    object_id, find_merge_strategy, find_entity, entity_simple_summary, entitiesdescriptor
+from whoosh.fields import Schema, TEXT, ID, KEYWORD, STORED, BOOLEAN
+from whoosh import writing
+from . import merge_strategies
+import ipaddr
+import operator
+import six
 
 DINDEX = ('sha1', 'sha256', 'null')
 
 
-class StoreBase(object):
+def make_store_instance():
+    new_store = load_callable(config.store_class)
+    return new_store()
+
+
+class SAMLStoreBase(object):
     def lookup(self, key):
         raise NotImplementedError()
 
@@ -48,8 +56,346 @@ class StoreBase(object):
     def entity_ids(self):
         return set(e.get('entityID') for e in self.lookup('entities'))
 
+    def _select(self, member=None):
+        if member is None:
+            member = "entities"
 
-class MemoryStore(StoreBase):
+        if type(member) is str or type(member) is unicode:
+            if '!' in member:
+                (src, xp) = member.split("!")
+                if len(src) == 0:
+                    src = None
+                return self.select(src, xp=xp)
+
+        log.debug("calling store lookup %s" % member)
+        return self.select(member)
+
+    def select(self, member, xp=None):
+        """
+        Select a set of metadata elements and return an EntityDescriptor with the result of the select.
+
+        :param member: A selector (cf below)
+        :type member: basestring
+        :param xp: An optional xpath filter
+        :type xp: basestring
+        :return: An interable of EntityDescriptor elements
+        :rtype: etree.Element
+
+
+        **Selector Syntax**
+
+            - selector "+" selector
+            - [sourceID] "!" xpath
+            - attribute=value or {attribute}value
+            - entityID
+            - source (typically @Name from an EntitiesDescriptor set but could also be an alias)
+
+        The first form results in the intersection of the results of doing a lookup on the selectors. The second form
+        results in the EntityDescriptor elements from the source (defaults to all EntityDescriptors) that match the
+        xpath expression. The attribute-value forms resuls in the EntityDescriptors that contain the specified entity
+        attribute pair. If non of these forms apply, the lookup is done using either source ID (normally @Name from
+        the EntitiesDescriptor) or the entityID of single EntityDescriptors. If member is a URI but isn't part of
+        the metadata repository then it is fetched an treated as a list of (one per line) of selectors. If all else
+        fails an empty list is returned.
+        """
+        l = self._select(member)
+        if hasattr(l, 'tag'):
+            l = [l]
+        elif hasattr(l, '__iter__'):
+            l = list(l)
+
+        if xp is None:
+            return l
+        else:
+            log.debug("filtering %d entities using xpath %s" % (len(l), xp))
+            t = entitiesdescriptor(l, 'dummy', lookup_fn=self.select)
+            if t is None:
+                return []
+            l = root(t).xpath(xp, namespaces=NS, smart_strings=False)
+            log.debug("got %d entities after filtering" % len(l))
+            return l
+
+    def merge(self, t, nt, strategy=merge_strategies.replace_existing, strategy_name=None):
+        """
+:param t: The EntitiesDescriptor element to merge *into*
+:param nt:  The EntitiesDescriptor element to merge *from*
+:param strategy: A callable implementing the merge strategy pattern
+:param strategy_name: The name of a strategy to import. Overrides the callable if present.
+:return:
+
+Two EntitiesDescriptor elements are merged - the second into the first. For each element
+in the second collection that is present (using the @entityID attribute as key) in the
+first the strategy callable is called with the old and new EntityDescriptor elements
+as parameters. The strategy callable thus must implement the following pattern:
+
+:old_e: The EntityDescriptor from t
+:e: The EntityDescriptor from nt
+:return: A merged EntityDescriptor element
+
+Before each call to strategy old_e is removed from the MDRepository index and after
+merge the resultant EntityDescriptor is added to the index before it is used to
+replace old_e in t.
+        """
+        if strategy_name is not None:
+            strategy = find_merge_strategy(strategy_name)
+
+        for e in iter_entities(nt):
+            entity_id = e.get("entityID")
+            # we assume ddup:ed tree
+            old_e = find_entity(t, entity_id)
+            new = strategy(old_e, e)
+            if new is not None:
+                self.update(new)
+
+    def search(self, query=None, path=None, page=None, page_limit=10, entity_filter=None, related=None):
+        """
+:param query: A string to search for.
+:param path: The repository collection (@Name) to search in - None for search in all collections
+:param page:  When using paged search, the page index
+:param page_limit: When using paged search, the maximum entry per page
+:param entity_filter: An optional lookup expression used to filter the entries before search is done.
+:param related: an optional '+'-separated list of related domain names for prioritizing search results
+
+Returns a list of dict's for each EntityDescriptor present in the metadata store such
+that any of the DisplayName, ServiceName, OrganizationName or OrganizationDisplayName
+elements match the query (as in contains the query as a substring).
+
+The dict in the list contains three items:
+
+:title: A displayable string, useful as a UI label
+:value: The entityID of the EntityDescriptor
+:id: A sha1-ID of the entityID - on the form {sha1}<sha1-hash-of-entityID>
+        """
+
+        match_query = bool(len(query) > 0)
+
+        if isinstance(query, basestring):
+            query = [query.lower()]
+
+        def _strings(elt):
+            lst = []
+            for attr in ['{%s}DisplayName' % NS['mdui'],
+                         '{%s}ServiceName' % NS['md'],
+                         '{%s}OrganizationDisplayName' % NS['md'],
+                         '{%s}OrganizationName' % NS['md'],
+                         '{%s}Keywords' % NS['mdui'],
+                         '{%s}Scope' % NS['shibmd']]:
+                lst.extend([s.text for s in elt.iter(attr)])
+            lst.append(elt.get('entityID'))
+            return filter(lambda item: item is not None, lst)
+
+        def _ip_networks(elt):
+            return [ipaddr.IPNetwork(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
+
+        def _match(qq, elt):
+            for q in qq:
+                q = q.strip()
+                if ':' in q or '.' in q:
+                    try:
+                        nets = _ip_networks(elt)
+                        for net in nets:
+                            if ':' in q and ipaddr.IPv6Address(q) in net:
+                                return net
+                            if '.' in q and ipaddr.IPv4Address(q) in net:
+                                return net
+                    except ValueError:
+                        pass
+
+                if q is not None and len(q) > 0:
+                    tokens = _strings(elt)
+                    for tstr in tokens:
+                        for tpart in tstr.split():
+                            if tpart.lower().startswith(q):
+                                return tstr
+            return None
+
+        f = []
+        if path is not None and path not in f:
+            f.append(path)
+        if entity_filter is not None and entity_filter not in f:
+            f.append(entity_filter)
+        mexpr = None
+        if f:
+            mexpr = "+".join(f)
+
+        log.debug("match using '%s'" % mexpr)
+        res = []
+        for e in self.lookup(mexpr):
+            d = None
+            if match_query:
+                m = _match(query, e)
+                if m is not None:
+                    d = entity_simple_summary(e)
+                    ll = d['title'].lower()
+                    d['matched'] = m
+            else:
+                d = entity_simple_summary(e)
+
+            if d is not None:
+                if related is not None:
+                    d['ddist'] = avg_domain_distance(related, d['domains'])
+                else:
+                    d['ddist'] = 0
+
+                res.append(d)
+
+        res.sort(key=operator.itemgetter('title'))
+        res.sort(key=operator.itemgetter('ddist'), reverse=True)
+
+        if page is not None:
+            total = len(res)
+            begin = (page - 1) * page_limit
+            end = begin + page_limit
+            more = (end < total)
+            return res[begin:end], more, total
+        else:
+            return res
+
+
+class WhooshStore(SAMLStoreBase):
+
+    def __init__(self):
+        self.schema = Schema(scopes=KEYWORD(),
+                             descr=TEXT(),
+                             service_name=TEXT(),
+                             service_descr=TEXT(),
+                             keywords=KEYWORD())
+        self.schema.add("object_id", ID(stored=True, unique=True))
+        self.schema.add("entity_id", ID(stored=True, unique=True))
+        for a in ATTRS.keys():
+            self.schema.add(a, KEYWORD())
+        self._collections = set()
+        from whoosh.filedb.filestore import RamStorage, FileStorage
+        self.storage = RamStorage()
+        self.storage.create()
+        self.index = self.storage.create_index(self.schema)
+        self.objects = dict()
+        self.infos = dict()
+
+    def dump(self):
+        ix = self.storage.open_index()
+        print(ix.schema)
+        from whoosh.query import Every
+        with ix.searcher() as searcher:
+            for result in ix.searcher().search(Every('object_id')):
+                print(result)
+
+    def _index_prep(self, info):
+        if 'entity_attributes' in info:
+            for a,v in info.pop('entity_attributes').items():
+                info[a] = v
+        for a,v in info.items():
+            if type(v) is not list and type(v) is not tuple:
+               info[a] = [info.pop(a)]
+
+            if a in ATTRS_INV:
+                info[ATTRS_INV[a]] = info.pop(a)
+
+        for a in info.keys():
+            if not a in self.schema.names():
+                del info[a]
+
+        for a,v in info.items():
+            info[a] = [six.text_type(vv) for vv in v]
+
+    def _index(self, e, tid=None):
+        info = entity_info(e)
+        if tid is not None:
+            info['collection_id'] = tid
+        self._index_prep(info)
+        id = six.text_type(object_id(e))
+        # mix in tid here
+        self.infos[id] = info
+        self.objects[id] = e
+        ix = self.storage.open_index()
+        with ix.writer() as writer:
+            writer.add_document(object_id=id, **info)
+            writer.mergetype = writing.CLEAR
+
+    def update(self, t, tid=None, ts=None, merge_strategy=None):
+        relt = root(t)
+        assert (relt is not None)
+        ne = 0
+
+        if relt.tag == "{%s}EntityDescriptor" % NS['md']:
+            self._index(relt)
+            ne += 1
+        elif relt.tag == "{%s}EntitiesDescriptor" % NS['md']:
+            if tid is None:
+                tid = relt.get('Name')
+            self._collections.add(tid)
+            for e in iter_entities(t):
+                self._index(e, tid=tid)
+                ne += 1
+
+        return ne
+
+    def collections(self):
+        return self._collections
+
+    def reset(self):
+        self.__init__()
+
+    def size(self, a=None, v=None):
+        if a is None:
+            return len(self.objects.keys())
+        elif a is not None and v is None:
+            return len(self.attribute(a))
+        else:
+            return len(self.lookup("{!s}={!s}".format(a,v)))
+
+    def _attributes(self):
+        ix = self.storage.open_index()
+        with ix.reader() as reader:
+            for n in reader.indexed_field_names():
+                if n in ATTRS:
+                    yield ATTRS[n]
+
+    def attributes(self):
+        return list(self._attributes())
+
+    def attribute(self, a):
+        if a in ATTRS_INV:
+            n = ATTRS_INV[a]
+            ix = self.storage.open_index()
+            with ix.searcher() as searcher:
+                return list(searcher.lexicon(n))
+        else:
+            return []
+
+    def lookup(self, key, raw=True, field="entity_id"):
+        if key == 'entities' or key is None:
+            if raw:
+                return self.objects.values()
+            else:
+                return self.infos.values()
+
+        from whoosh.qparser import QueryParser
+        #import pdb; pdb.set_trace()
+        key = key.strip('+')
+        key = key.replace('+', ' AND ')
+        for uri,a in ATTRS_INV.items():
+            key = key.replace(uri,a)
+        key = " {!s} ".format(key)
+        key = re.sub("([^=]+)=(\S+)","\\1:\\2",key)
+        key = re.sub("{([^}]+)}(\S+)", "\\1:\\2", key)
+        key = key.strip()
+
+        qp = QueryParser("object_id", schema=self.schema)
+        q = qp.parse(key)
+        lst = set()
+        with self.index.searcher() as searcher:
+            results = searcher.search(q,limit=None)
+            for result in results:
+                if raw:
+                    lst.add(self.objects[result['object_id']])
+                else:
+                    lst.add(self.infos[result['object_id']])
+
+        return list(lst)
+
+
+class MemoryStore(SAMLStoreBase):
     def __init__(self):
         self.md = dict()
         self.index = dict()
@@ -207,14 +553,14 @@ class MemoryStore(StoreBase):
         return []
 
 
-class RedisStore(StoreBase):
-    def __init__(self, version=_now(), default_ttl=3600 * 24 * 4, respect_validity=True):
+class RedisStore(SAMLStoreBase):
+    def __init__(self, version=ts_now(), default_ttl=3600 * 24 * 4, respect_validity=True):
         self.rc = Redis()
         self.default_ttl = default_ttl
         self.respect_validity = respect_validity
 
     def _expiration(self, relt):
-        ts = _now() + self.default_ttl
+        ts = ts_now() + self.default_ttl
         if self.respect_validity:
             return valid_until_ts(relt, ts)
 
@@ -231,7 +577,7 @@ class RedisStore(StoreBase):
                 self.rc.srem(an, c)
 
     def periodic(self, stats):
-        now = _now()
+        now = ts_now()
         stats['Last Periodic Maintenance'] = now
         log.debug("periodic maintentance...")
         self.rc.zremrangebyscore("members", "-inf", now)
@@ -262,7 +608,7 @@ class RedisStore(StoreBase):
         return self.rc.smembers("#attributes")
 
     def attribute(self, an):
-        return self.rc.zrangebyscore("%s#values" % an, _now(), "+inf")
+        return self.rc.zrangebyscore("%s#values" % an, ts_now(), "+inf")
 
     def collections(self):
         return self.rc.smembers("#collections")
@@ -272,7 +618,7 @@ class RedisStore(StoreBase):
         relt = root(t)
         ne = 0
         if ts is None:
-            ts = int(_now() + 3600 * 24 * 4)  # 4 days is the arbitrary default expiration
+            ts = int(ts_now() + 3600 * 24 * 4)  # 4 days is the arbitrary default expiration
         if relt.tag == "{%s}EntityDescriptor" % NS['md']:
             if tid is None:
                 tid = relt.get('entityID')
@@ -316,7 +662,7 @@ class RedisStore(StoreBase):
     def _members(self, k):
         mem = []
         if self.rc.exists("%s#members" % k):
-            for entity_id in self.rc.zrangebyscore("%s#members" % k, _now(), "+inf"):
+            for entity_id in self.rc.zrangebyscore("%s#members" % k, ts_now(), "+inf"):
                 mem.extend(self.lookup(entity_id))
         return mem
 
@@ -353,4 +699,4 @@ class RedisStore(StoreBase):
             return self._members(key)
 
     def size(self):
-        return self.rc.zcount("entities#members", _now(), "+inf")
+        return self.rc.zcount("entities#members", ts_now(), "+inf")

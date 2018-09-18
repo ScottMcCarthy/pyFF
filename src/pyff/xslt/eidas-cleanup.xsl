@@ -1,6 +1,8 @@
 <?xml version="1.0"?>
 <xsl:stylesheet version="1.0"
                 xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+                xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-Instance"
                 xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
                 xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
                 xmlns:samla="urn:oasis:names:tc:SAML:2.0:assertion"
@@ -67,14 +69,14 @@
 
     <xsl:template match="md:Extensions[not(mdattr:EntityAttributes)]">
         <md:Extensions>
-            <mdattr:EntityAttributes/>
+            <xsl:call-template name="eidas-attributes-wrapper"/>
             <xsl:apply-templates/>
         </md:Extensions>
     </xsl:template>
 
     <xsl:template match="saml:Extensions[not(mdattr:EntityAttributes)]">
         <md:Extensions>
-            <mdattr:EntityAttributes/>
+            <xsl:call-template name="eidas-attributes-wrapper"/>
             <xsl:apply-templates/>
         </md:Extensions>
     </xsl:template>
@@ -86,7 +88,15 @@
         </xsl:element>
     </xsl:template>
 
-    <xsl:template name="attributes">
+    <xsl:template name="eidas-attributes-wrapper">
+        <xsl:if test="$eidas_endpoint_type and $eidas_territory">
+            <mdattr:EntityAttributes>
+                <xsl:call-template name="eidas-attributes"/>
+            </mdattr:EntityAttributes>
+        </xsl:if>
+    </xsl:template>
+
+    <xsl:template name="eidas-attributes">
         <xsl:if test="$eidas_endpoint_type and $eidas_territory">
             <samla:Attribute Name="https://pyff.io/eidas/endpoint_type">
                 <samla:AttributeValue><xsl:value-of select="$eidas_endpoint_type"/></samla:AttributeValue>
@@ -95,26 +105,28 @@
                 <samla:AttributeValue><xsl:value-of select="$eidas_territory"/></samla:AttributeValue>
             </samla:Attribute>
         </xsl:if>
-        <xsl:copy>
-            <xsl:apply-templates select="node()|@*"/>
-        </xsl:copy>
     </xsl:template>
 
     <xsl:template match="md:EntityDescriptor[not(md:Extensions) and not(saml:Extensions)]">
         <md:EntityDescriptor>
-            <md:Extensions/>
+            <xsl:attribute name="entityID"><xsl:value-of select="@entityID"></xsl:value-of></xsl:attribute>
             <xsl:apply-templates/>
         </md:EntityDescriptor>
     </xsl:template>
 
     <xsl:template match="mdattr:EntityAttributes">
-        <xsl:call-template name="attributes"/>
+        <xsl:call-template name="eidas-attributes"/>
+        <xsl:copy>
+          <xsl:apply-templates select="node()|@*"/>
+        </xsl:copy>
     </xsl:template>
 
     <!-- just copy everything else -->
     <xsl:template match="text()|comment()|@*">
         <xsl:copy/>
     </xsl:template>
+
+    <xsl:template match="@type"/>
 
     <xsl:template match="*">
         <xsl:copy>
